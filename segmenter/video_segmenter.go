@@ -14,10 +14,10 @@ import (
 	"path"
 
 	"github.com/golang/glog"
-	"github.com/livepeer/lpms/ffmpeg"
-	"github.com/livepeer/lpms/stream"
-	"github.com/livepeer/m3u8"
-	"github.com/livepeer/joy4/av"
+	"github.com/GGehle/lpms/ffmpeg"
+	"github.com/GGehle/lpms/stream"
+	"github.com/GGehle/m3u8"
+	"github.com/GGehle/joy4/av"
 )
 
 var ErrSegmenterTimeout = errors.New("SegmenterTimeout")
@@ -67,6 +67,7 @@ func NewFFMpegVideoSegmenter(workDir string, strmID string, localRtmpUrl string,
 		opt.SegLength = time.Second * 4
 	}
 	return &FFMpegVideoSegmenter{WorkDir: workDir, StrmID: strmID, LocalRtmpUrl: localRtmpUrl, SegLen: opt.SegLength, curSegment: opt.StartSeq}
+	
 }
 
 //RTMPToHLS invokes FFMpeg to do the segmenting. This method blocks until the segmenter exits.
@@ -86,7 +87,7 @@ func (s *FFMpegVideoSegmenter) RTMPToHLS(ctx context.Context, cleanup bool) erro
 	if cleanup {
 		s.Cleanup()
 	}
-	return ret
+	return ret  
 }
 
 //PollSegment monitors the filesystem and returns a new segment as it becomes available
@@ -128,6 +129,48 @@ func (s *FFMpegVideoSegmenter) PollSegment(ctx context.Context) (*VideoSegment, 
 	// glog.Infof("Segment: %v, len:%v", name, len(seg))
 	return &VideoSegment{Codec: av.H264, Format: stream.HLS, Length: length, Data: seg, Name: name, SeqNo: uint64(s.curSegment - 1)}, err
 }
+
+//PollSegment monitors the filesystem and returns a new segment as it becomes available to IPFS
+func (s *FFMpegVideoSegmenter) PollSegment(ctx context.Context) (*VideoSegment, error) {
+	var length time.Duration
+	curTsfn := s.WorkDir + "/" + s.StrmID + "_" + strconv.Itoa(s.curSegment) + ".ts"
+	nextTsfn := s.WorkDir + "/" + s.StrmID + "_" + strconv.Itoa(s.curSegment+1) + ".ts"
+	seg, err := s.pollSegment(ctx, curTsfn, nextTsfn, time.Millisecond*100)
+	if err != nil {
+		return nil, err
+	}
+
+	name := s.StrmID + "_" + strconv.Itoa(s.curSegment) + ".ts"
+	plfn := fmt.Sprintf("%s/%s.m3u8", s.WorkDir, s.StrmID)
+
+	for i := 0; i < PlaylistRetryCount; i++ {
+		pl, _ := m3u8.NewMediaPlaylist(uint(s.curSegment+1), uint(s.curSegment+1))
+		content := readPlaylist(plfn)
+		pl.DecodeFrom(bytes.NewReader(content), true)
+		for _, plSeg := range pl.Segments {
+			if plSeg != nil && plSeg.URI == name {
+				length, err = time.ParseDuration(fmt.Sprintf("%vs", plSeg.Duration))
+				break
+			}
+		}
+		if length != 0 {
+			break
+		}
+		if i < PlaylistRetryCount {
+			glog.V(4).Infof("Waiting to load duration from playlist")
+			time.Sleep(PlaylistRetryWait)
+			continue
+		} else {
+			length, err = time.ParseDuration(fmt.Sprintf("%vs", pl.TargetDuration))
+		}
+	}
+
+	s.curSegment = s.curSegment + 1
+	// glog.Infof("Segment: %v, len:%v", name, len(seg))
+	ipfs add VideoSegment{Codec: av.H264, Format: stream.HLS, Length: length, Data: seg, Name: name, SeqNo: uint64(s.curSegment - 1)} , err 
+}
+
+
 
 //PollPlaylist monitors the filesystem and returns a new playlist as it becomes available
 func (s *FFMpegVideoSegmenter) PollPlaylist(ctx context.Context) (*VideoPlaylist, error) {
